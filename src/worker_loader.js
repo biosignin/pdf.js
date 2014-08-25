@@ -20,7 +20,8 @@
 
 // List of shared files to include;
 var sharedFiles = [
-  'shared/util.js'
+  'shared/util.js',
+  'shared/r.js'
 ];
 
 // List of other files to include;

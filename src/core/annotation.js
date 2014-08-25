@@ -241,7 +241,9 @@ var Annotation = (function AnnotationClosure() {
 
       if (fieldType === 'Tx') {
         return TextWidgetAnnotation;
-      } else {
+      } else if (fieldType === 'Sig') {
+        return SigWidgetAnnotation;
+      }  else {
         return WidgetAnnotation;
       }
     } else {
@@ -372,17 +374,192 @@ var WidgetAnnotation = (function WidgetAnnotationClosure() {
   var parent = Annotation.prototype;
   Util.inherit(WidgetAnnotation, Annotation, {
     isViewable: function WidgetAnnotation_isViewable() {
-      if (this.data.fieldType === 'Sig') {
-        warn('unimplemented annotation type: Widget signature');
-        return false;
-      }
-
       return parent.isViewable.call(this);
     }
   });
 
   return WidgetAnnotation;
 })();
+
+var SigWidgetAnnotation = (function SigWidgetAnnotationClosure() {
+  function SigWidgetAnnotation(params) {
+    WidgetAnnotation.call(this, params);
+
+    var dict = params.dict;
+
+    var data = this.data;
+
+    data.fieldValue = Util.getInheritableProperty(params.dict, 'V');
+    
+    if(!data.fieldValue) return;
+
+    var contentsValue = data.fieldValue.get('Contents');
+    var byteRange = data.fieldValue.get('ByteRange'); 
+    var subFilter = data.fieldValue.get("SubFilter");
+
+   
+
+
+    require(['forge.bundle'], function (forge) {
+      function preparePKCS7(str) {
+        var p7 = "-----BEGIN PKCS7-----\n";
+        p7 +=str;
+        p7 += "\n-----END PKCS7-----";
+        return p7;
+      }
+      try{
+      var isCades = subFilter.name == "ETSI.CAdES.detached";
+      var isTsp   = subFilter.name == "ETSI.RFC3161";
+
+       /* pkcs7 der encoded object */
+      var pkcs7object = preparePKCS7(forge.util.encode64(contentsValue,64));
+
+      var validCert = true;
+      var validHash = true;
+      var docModified = true;
+
+      /* pkcs7 object */
+      var p7 = forge.pkcs7.messageFromPem(pkcs7object);
+
+      /* certificate chain */
+      var certificateChain = p7.certificates;
+
+      var signCert = certificateChain[0];
+      var signSerialNumber = forge.util.bytesToHex(p7.rawCapture.signerInfos[0].value[1].value[1].value);
+      var sequentialCertChain = [];
+      /* find the signing cert */
+      for (var index = 0; index < certificateChain.length; ++index) {
+          if(certificateChain[index].serialNumber == signSerialNumber){
+            signCert = certificateChain[index];
+            sequentialCertChain.push(signCert);
+            break;
+          }
+      }
+      var lastFound = signCert;
+      for (var index = 0; index < certificateChain.length; ++index) {
+          if(lastFound != certificateChain[index] && lastFound.isIssuer(certificateChain[index])){
+            lastFound = certificateChain[index];
+            sequentialCertChain.push(lastFound);
+            index = 0;
+          }
+      }
+      
+      /* verifies the signature in signerInfo */
+      var digestAlgo = forge.oids[forge.asn1.derToOid(p7.rawCapture.signerInfos[0].value[2].value[0].value)];
+      var attrSet = forge.asn1.create(forge.asn1.Class.UNIVERSAL, forge.asn1.Type.SET, true, p7.rawCapture.authenticatedAttributes);
+      var md = forge.md[digestAlgo].create();      
+      md.update(forge.asn1.toDer(attrSet).bytes());
+      var authdigest = md.digest().bytes();
+
+      //var signed = "6bfd7226e101c2874630174ba846b92aa4d824d8bb5ff2b7404f776f0668e18b3d7c66945b7616505668b194639d4a75d09fa62299ad769964c0711c953b126526a5bbb0474d44aa373c09951ad60411cb3c576fb338314c5e697d6c9f366f1e50eedc3734894d5ca1372c79a4359a569ea146926275878381ba4e7e98957882";
+      validHash = signCert.publicKey.verify(authdigest,p7.rawCapture.signature);
+      
+      if(validHash){
+        //Verify that the MessageDigest (oid 1.2.840.113549.1.9.4) in authenticatedAttributes is equal to the 
+        //digest of the document
+        var attrlenght = p7.rawCapture.authenticatedAttributes.length;
+        for(var index = 0 ; index<attrlenght ; index++){
+          var authattr = p7.rawCapture.authenticatedAttributes[index];
+          if(forge.asn1.derToOid(authattr.value[0].value) == forge.oids['messageDigest']){
+             /* prepares file contents to be hashed, excluding the contents part according to the byterange */
+            var fileContents = getContentForDigest(byteRange, dict.xref.stream.bytes);
+            md = forge.md[digestAlgo].create();
+            md.update(fileContents);
+            var doc_hash = md.digest().bytes();
+            
+            docModified = !(authattr.value[1].value[0].value == doc_hash);
+          }
+          
+        }
+      }
+
+ /* @param ed the encrypted data to decrypt in as a byte string.
+ * @param key the RSA key to use.
+ * @param pub true for a public key operation, false for private.
+ * @param ml the message length, if known, false to disable padding.
+ * @return the decrypted message as a byte string.
+ */
+
+      //compare decrypted with the hash value
+
+      /* check if the hash value
+          in the pkcs7 object matches the pdf's hash value
+      var res = toHex(contentsValue).indexOf(hash_data);
+      if(res == -1) { // hash value not found in the contentsValue
+        validHash = false;
+      }*/
+
+      /* check the certificate chain */
+
+      try {
+        if(sequentialCertChain.length > 1){
+          var caStore = forge.pki.createCaStore();
+          caStore.addCertificate(sequentialCertChain[sequentialCertChain.length-1]);
+          forge.pki.verifyCertificateChain(caStore, sequentialCertChain);
+        }else{
+           validCert = false;
+           console.log("Cannot verify the signing certificate, chain missing");
+        }
+      } catch(err) {
+        validCert = false;
+        console.log(err.message);
+      }
+
+      if(validCert && validHash && !docModified) {
+        /* valid digital signature */
+        console.log("Valid signature!");
+      }
+      else {
+        console.log("Invalid signature!\nReason:");
+      }
+
+      if(!validHash) { console.log("- invalid hash"); }
+      if(!validCert) { console.log("- invalid cert"); }
+      if(docModified) { console.log("- document modified after signature"); }
+
+      this.visible = validHash && validCert && !docModified;
+
+      console.log("Signed by  " + signCert.subject.getField("CN").value);
+      console.log("\n\n");
+
+    }catch(e){console.log(e);}
+    });
+      
+
+  }
+
+  var parent = WidgetAnnotation.prototype;
+  Util.inherit(SigWidgetAnnotation, WidgetAnnotation, {
+   isViewable: function WidgetAnnotation_isViewable() {
+      return parent.isViewable.call(this);
+    }
+  });
+  
+  return SigWidgetAnnotation;
+  
+})();
+
+
+
+function getContentForDigest(byteRange, pdfData) {
+
+  var lim1 = byteRange[0];
+      var lim2 = byteRange[1];
+      var lim3 = byteRange[2];
+      var lim4 = byteRange[3];
+
+      var x = '';
+      for(var i = lim1; i < (lim3+lim4); i++) {
+        if(i < lim2 || i >= (lim3)) {
+          x += String.fromCharCode(pdfData[i]);
+        }
+      }
+
+      return x;
+    }
+
+
+
 
 var TextWidgetAnnotation = (function TextWidgetAnnotationClosure() {
   function TextWidgetAnnotation(params) {
